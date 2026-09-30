@@ -14,6 +14,7 @@
 #include "crypto/sm2.h"
 #include "crypto/sm2err.h"
 #include "crypto/ec.h" /* ossl_ec_group_do_inverse_ord() */
+#include "crypto/bn.h" /* fixed-top / Montgomery constant-time BN helpers */
 #include "internal/numbers.h"
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -212,15 +213,19 @@ static ECDSA_SIG *sm2_sig_gen(const EC_KEY *key, const BIGNUM *e)
     EC_POINT *kG = NULL;
     BN_CTX *ctx = NULL;
     BIGNUM *k = NULL;
-    BIGNUM *rk = NULL;
     BIGNUM *r = NULL;
     BIGNUM *s = NULL;
     BIGNUM *x1 = NULL;
     BIGNUM *tmp = NULL;
+    BN_MONT_CTX *mont = EC_GROUP_get_mont_data(group);
     OSSL_LIB_CTX *libctx = ossl_ec_key_get_libctx(key);
 
     if (dA == NULL) {
         ERR_raise(ERR_LIB_SM2, SM2_R_INVALID_PRIVATE_KEY);
+        goto done;
+    }
+    if (mont == NULL) {
+        ERR_raise(ERR_LIB_SM2, ERR_R_EC_LIB);
         goto done;
     }
     kG = EC_POINT_new(group);
@@ -232,7 +237,6 @@ static ECDSA_SIG *sm2_sig_gen(const EC_KEY *key, const BIGNUM *e)
 
     BN_CTX_start(ctx);
     k = BN_CTX_get(ctx);
-    rk = BN_CTX_get(ctx);
     x1 = BN_CTX_get(ctx);
     tmp = BN_CTX_get(ctx);
     if (tmp == NULL) {
@@ -266,6 +270,11 @@ static ECDSA_SIG *sm2_sig_gen(const EC_KEY *key, const BIGNUM *e)
             ERR_raise(ERR_LIB_SM2, ERR_R_INTERNAL_ERROR);
             goto done;
         }
+        BN_set_flags(k, BN_FLG_CONSTTIME);
+        if (!bn_set_top_fixed(k, bn_get_top(order))) {
+            ERR_raise(ERR_LIB_SM2, ERR_R_BN_LIB);
+            goto done;
+        }
 
         if (!EC_POINT_mul(group, kG, k, NULL, NULL, ctx)
             || !EC_POINT_get_affine_coordinates(group, kG, x1, NULL,
@@ -275,23 +284,28 @@ static ECDSA_SIG *sm2_sig_gen(const EC_KEY *key, const BIGNUM *e)
             goto done;
         }
 
-        /* try again if r == 0 or r+k == n */
+        /* try again if r == 0 or r + k == n */
         if (BN_is_zero(r))
             continue;
 
-        if (!BN_add(rk, r, k)) {
-            ERR_raise(ERR_LIB_SM2, ERR_R_INTERNAL_ERROR);
+        /* r + k == n exactly when k == n - r. */
+        if (!BN_sub(tmp, order, r)
+            || !bn_set_top_fixed(tmp, bn_get_top(order))) {
+            ERR_raise(ERR_LIB_SM2, ERR_R_BN_LIB);
             goto done;
         }
 
-        if (BN_cmp(rk, order) == 0)
+        if (CRYPTO_memcmp(bn_get_words(k), bn_get_words(tmp),
+                          bn_get_top(order) * sizeof(BN_ULONG)) == 0)
             continue;
 
         if (!BN_add(s, dA, BN_value_one())
             || !ossl_ec_group_do_inverse_ord(group, s, s, ctx)
-            || !BN_mod_mul(tmp, dA, r, order, ctx)
-            || !BN_sub(tmp, k, tmp)
-            || !BN_mod_mul(s, s, tmp, order, ctx)) {
+            || !bn_to_mont_fixed_top(tmp, r, mont, ctx)
+            || !bn_mul_mont_fixed_top(tmp, tmp, dA, mont, ctx)
+            || !bn_mod_sub_fixed_top(tmp, k, tmp, order)
+            || !bn_to_mont_fixed_top(tmp, tmp, mont, ctx)
+            || !BN_mod_mul_montgomery(s, tmp, s, mont, ctx)) {
             ERR_raise(ERR_LIB_SM2, ERR_R_BN_LIB);
             goto done;
         }
