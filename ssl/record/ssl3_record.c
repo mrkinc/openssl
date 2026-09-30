@@ -1067,6 +1067,24 @@ int tls1_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int sending,
                     & EVP_CIPH_FLAG_AEAD_CIPHER)
                 != 0) {
                 unsigned char *seq;
+                size_t aead_overhead = EVP_CIPHER_CTX_get_tag_length(ds);
+
+                /*
+                 * Do not pass an impossible TLS 1.2 AEAD record to the
+                 * cipher.  GCM and CCM have an eight-byte explicit IV; all
+                 * TLS AEAD records have their configured authentication tag.
+                 * The caller maps this public validation failure to
+                 * bad_record_mac for TLS and silently drops it for DTLS.
+                 */
+                if (aead_overhead == 0
+                    && EVP_CIPHER_get_nid(enc) == NID_chacha20_poly1305)
+                    aead_overhead = EVP_CHACHAPOLY_TLS_TAG_LEN;
+                if (SSL_USE_EXPLICIT_IV(s)
+                    && (EVP_CIPHER_get_mode(enc) == EVP_CIPH_GCM_MODE
+                        || EVP_CIPHER_get_mode(enc) == EVP_CIPH_CCM_MODE))
+                    aead_overhead += EVP_GCM_TLS_EXPLICIT_IV_LEN;
+                if (!sending && reclen[ctr] < aead_overhead)
+                    return 0;
 
                 seq = sending ? RECORD_LAYER_get_write_sequence(&s->rlayer)
                               : RECORD_LAYER_get_read_sequence(&s->rlayer);
