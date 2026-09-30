@@ -1384,6 +1384,25 @@ static int check_crl_chain(X509_STORE_CTX *ctx,
     return X509_cmp(cert_ta, crl_ta) == 0;
 }
 
+/* Construct a relative CRL distribution point name only for this comparison. */
+static X509_NAME *crldp_full_name(const X509 *x, const DIST_POINT *dp)
+{
+    const X509_NAME *iname = NULL;
+    int i;
+
+    for (i = 0; i < sk_GENERAL_NAME_num(dp->CRLissuer); i++) {
+        GENERAL_NAME *gen = sk_GENERAL_NAME_value(dp->CRLissuer, i);
+
+        if (gen->type == GEN_DIRNAME) {
+            iname = gen->d.directoryName;
+            break;
+        }
+    }
+    if (iname == NULL)
+        iname = X509_get_issuer_name(x);
+    return ossl_dist_point_name_full(dp->distpoint, iname);
+}
+
 /*-
  * Check for match between two dist point names: three separate cases.
  * 1. Both are relative names and compare X509_NAME types.
@@ -1391,9 +1410,10 @@ static int check_crl_chain(X509_STORE_CTX *ctx,
  * 3. Both are full names and compare two GENERAL_NAMES.
  * 4. One is NULL: automatic match.
  */
-static int idp_check_dp(DIST_POINT_NAME *a, DIST_POINT_NAME *b)
+static int idp_check_dp(DIST_POINT_NAME *a, const X509_NAME *aname,
+                        DIST_POINT_NAME *b)
 {
-    X509_NAME *nm = NULL;
+    const X509_NAME *nm = NULL;
     GENERAL_NAMES *gens = NULL;
     GENERAL_NAME *gena, *genb;
     int i, j;
@@ -1401,16 +1421,16 @@ static int idp_check_dp(DIST_POINT_NAME *a, DIST_POINT_NAME *b)
     if (a == NULL || b == NULL)
         return 1;
     if (a->type == 1) {
-        if (a->dpname == NULL)
+        if (aname == NULL)
             return 0;
         /* Case 1: two X509_NAME */
         if (b->type == 1) {
             if (b->dpname == NULL)
                 return 0;
-            return X509_NAME_cmp(a->dpname, b->dpname) == 0;
+            return X509_NAME_cmp(aname, b->dpname) == 0;
         }
         /* Case 2: set name and GENERAL_NAMES appropriately */
-        nm = a->dpname;
+        nm = aname;
         gens = b->name.fullname;
     } else if (b->type == 1) {
         if (b->dpname == NULL)
@@ -1483,13 +1503,23 @@ static int crl_crldp_check(X509 *x, X509_CRL *crl, int crl_score,
     *preasons = crl->idp_reasons;
     for (i = 0; i < sk_DIST_POINT_num(x->crldp); i++) {
         DIST_POINT *dp = sk_DIST_POINT_value(x->crldp, i);
+        X509_NAME *dpname = NULL;
+        int match;
 
-        if (crldp_check_crlissuer(dp, crl, crl_score)) {
-            if (crl->idp == NULL
-                || idp_check_dp(dp->distpoint, crl->idp->distpoint)) {
-                *preasons &= dp->dp_reasons;
-                return 1;
-            }
+        if (!crldp_check_crlissuer(dp, crl, crl_score))
+            continue;
+        if (crl->idp == NULL) {
+            match = 1;
+        } else {
+            if (dp->distpoint != NULL && dp->distpoint->type == 1
+                && (dpname = crldp_full_name(x, dp)) == NULL)
+                continue;
+            match = idp_check_dp(dp->distpoint, dpname, crl->idp->distpoint);
+            X509_NAME_free(dpname);
+        }
+        if (match) {
+            *preasons &= dp->dp_reasons;
+            return 1;
         }
     }
     return (crl->idp == NULL || crl->idp->distpoint == NULL)
