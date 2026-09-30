@@ -575,6 +575,201 @@ end:
     return testresult;
 }
 
+#ifndef OPENSSL_NO_DTLS1_2
+/* A BIO filter that suspends writes after a prescribed number of records. */
+typedef struct {
+    BIO *bio;
+    int allowed;
+    int write_calls;
+} FRAG_BIO;
+
+static int frag_write(BIO *bio, const char *buf, size_t len, size_t *written)
+{
+    FRAG_BIO *f = BIO_get_data(bio);
+
+    BIO_clear_retry_flags(bio);
+    f->write_calls++;
+    if (f->allowed <= 0) {
+        BIO_set_retry_write(bio);
+        *written = 0;
+        return 0;
+    }
+    f->allowed--;
+    return BIO_write_ex(f->bio, buf, len, written);
+}
+
+static int frag_read(BIO *bio, char *buf, size_t len, size_t *readbytes)
+{
+    return BIO_read_ex(((FRAG_BIO *)BIO_get_data(bio))->bio, buf, len,
+                       readbytes);
+}
+
+static long frag_ctrl(BIO *bio, int cmd, long num, void *ptr)
+{
+    return BIO_ctrl(((FRAG_BIO *)BIO_get_data(bio))->bio, cmd, num, ptr);
+}
+
+static int frag_create(BIO *bio)
+{
+    FRAG_BIO *f = OPENSSL_zalloc(sizeof(*f));
+
+    if (f == NULL)
+        return 0;
+    BIO_set_data(bio, f);
+    BIO_set_init(bio, 1);
+    return 1;
+}
+
+static int frag_destroy(BIO *bio)
+{
+    FRAG_BIO *f = BIO_get_data(bio);
+
+    if (f != NULL) {
+        BIO_free(f->bio);
+        OPENSSL_free(f);
+    }
+    BIO_set_data(bio, NULL);
+    BIO_set_init(bio, 0);
+    return 1;
+}
+
+static BIO_METHOD *frag_method(void)
+{
+    static BIO_METHOD *method;
+
+    if (method == NULL) {
+        method = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_TYPE_FILTER,
+                              "fragment-limited dgram");
+        if (method != NULL) {
+            BIO_meth_set_write_ex(method, frag_write);
+            BIO_meth_set_read_ex(method, frag_read);
+            BIO_meth_set_ctrl(method, frag_ctrl);
+            BIO_meth_set_create(method, frag_create);
+            BIO_meth_set_destroy(method, frag_destroy);
+        }
+    }
+    return method;
+}
+
+static BIO *frag_new(BIO *next, int allowed)
+{
+    BIO *bio = BIO_new(frag_method());
+    FRAG_BIO *f;
+
+    if (bio == NULL) {
+        BIO_free(next);
+        return NULL;
+    }
+    f = BIO_get_data(bio);
+    f->bio = next;
+    f->allowed = allowed;
+    return bio;
+}
+
+/* Wait by polling the DTLS timer.  This avoids a platform-specific sleep API. */
+static int wait_for_dtls_timeout(SSL *ssl)
+{
+    struct timeval tv;
+    unsigned int tries = 0;
+
+    do {
+        if (DTLSv1_get_timeout(ssl, &tv) <= 0)
+            return 0;
+        if (++tries == 100000000)
+            return 0;
+    } while (tv.tv_sec != 0 || tv.tv_usec != 0);
+    return 1;
+}
+
+/*
+ * A ClientHello write is suspended after its first fragment.  Timer-driven
+ * retransmission must not touch the retransmit queue or overwrite the parked
+ * write state.
+ */
+static int test_dtls_suspended_write_retransmit(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    BIO *underlying = NULL, *wrapped = NULL;
+    FRAG_BIO *fb;
+    unsigned char alpn[750];
+    size_t used = 0, j;
+    int ret, err, i, before;
+    int testresult = 0;
+
+    if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
+            DTLS_client_method(), DTLS1_2_VERSION, DTLS1_2_VERSION,
+            &sctx, &cctx, cert, privkey)))
+        goto end;
+    SSL_CTX_set_verify(cctx, SSL_VERIFY_NONE, NULL);
+
+    for (j = 0; j < 3; j++) {
+        char name[250];
+        int n = snprintf(name, sizeof(name), "proto-%04u-%s", (unsigned int)j,
+                         "padpadpadpadpadpadpadpadpadpadpadpadpadpadpad"
+                         "padpadpadpadpadpadpadpadpadpadpadpadpadpadpad"
+                         "padpadpadpadpadpadpadpadpadpadpadpadpadpadpad"
+                         "padpadpadpadpadpadpadpadpadpadpadpadpadpadpad"
+                         "padpadpadpadpadpadpadpadpadpadpadpadpadpadpad");
+        if (!TEST_int_ge(n, 0) || !TEST_size_t_lt((size_t)n, sizeof(name))
+            || !TEST_size_t_le(used + 1 + (size_t)n, sizeof(alpn)))
+            goto end;
+        alpn[used++] = (unsigned char)n;
+        memcpy(alpn + used, name, (size_t)n);
+        used += (size_t)n;
+    }
+    if (!TEST_false(SSL_CTX_set_alpn_protos(cctx, alpn, (unsigned int)used))
+        || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+                                         NULL, NULL)))
+        goto end;
+
+    SSL_set_options(clientssl, SSL_OP_NO_QUERY_MTU);
+    if (!TEST_true(SSL_set_mtu(clientssl, 256)))
+        goto end;
+    underlying = SSL_get_wbio(clientssl);
+    if (!TEST_ptr(underlying) || !TEST_true(BIO_up_ref(underlying)))
+        goto end;
+    wrapped = frag_new(underlying, 1);
+    if (!TEST_ptr(wrapped)) {
+        underlying = NULL;
+        goto end;
+    }
+    underlying = NULL;
+    fb = BIO_get_data(wrapped);
+    SSL_set0_wbio(clientssl, wrapped);
+    wrapped = NULL;
+    DTLS_set_timer_cb(clientssl, timer_cb);
+
+    ret = SSL_connect(clientssl);
+    if (!TEST_int_le(ret, 0)
+        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_WRITE))
+        goto end;
+
+    fb->allowed = 100;
+    for (i = 0; i < 3; i++) {
+        before = fb->write_calls;
+        if (!TEST_true(wait_for_dtls_timeout(clientssl))
+            || !TEST_int_ge(DTLSv1_handle_timeout(clientssl), 0)
+            || !TEST_int_eq(fb->write_calls, before))
+            goto end;
+    }
+
+    ret = SSL_connect(clientssl);
+    err = SSL_get_error(clientssl, ret);
+    if (!TEST_false(err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL))
+        goto end;
+    testresult = 1;
+end:
+    BIO_free(underlying);
+    BIO_free(wrapped);
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return testresult;
+}
+#endif
+
 OPT_TEST_DECLARE_USAGE("certfile privkeyfile\n")
 
 int setup_tests(void)
@@ -596,6 +791,9 @@ int setup_tests(void)
     ADD_TEST(test_dtls_duplicate_records);
     ADD_TEST(test_just_finished);
     ADD_ALL_TESTS(test_swap_records, 4);
+#ifndef OPENSSL_NO_DTLS1_2
+    ADD_TEST(test_dtls_suspended_write_retransmit);
+#endif
 
     return 1;
 }
